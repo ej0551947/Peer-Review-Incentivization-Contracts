@@ -31,7 +31,8 @@
     abstract: (string-utf8 500),
     reward-amount: uint,
     status: (string-ascii 20),
-    review-count: uint
+    review-count: uint,
+    current-version: uint
   }
 )
 
@@ -41,7 +42,9 @@
     rating: uint,
     comment: (string-utf8 500),
     timestamp: uint,
-    rewarded: bool
+    rewarded: bool,
+    author-rating: (optional uint),
+    staked: uint
   }
 )
 
@@ -114,7 +117,8 @@
         abstract: abstract,
         reward-amount: reward-amount,
         status: "open",
-        review-count: u0
+        review-count: u0,
+        current-version: u1
       }
     )
     (ok new-paper-id)
@@ -138,7 +142,9 @@
         rating: rating,
         comment: comment,
         timestamp: stacks-block-height,
-        rewarded: false
+        rewarded: false,
+        author-rating: none,
+        staked: u0
       }
     )
     
@@ -213,5 +219,135 @@
     )
     
     (ok true)
+  )
+)
+
+
+
+(define-constant ERR_VERSION_NOT_FOUND (err u110))
+
+(define-map paper-versions
+  { paper-id: uint, version: uint }
+  {
+    title: (string-utf8 100),
+    abstract: (string-utf8 500),
+    timestamp: uint
+  }
+)
+
+(define-map paper
+  { paper-id: uint }
+  {
+    author: principal,
+    title: (string-utf8 100),
+    abstract: (string-utf8 500),
+    reward-amount: uint,
+    status: (string-ascii 20),
+    review-count: uint,
+    current-version: uint
+  }
+)
+
+(define-public (update-paper (paper-id uint) (new-title (string-utf8 100)) (new-abstract (string-utf8 500)))
+  (let (
+    (paper-info (unwrap! (get-paper paper-id) ERR_PAPER_NOT_FOUND))
+    (current-version (get current-version paper-info))
+    (next-version (+ current-version u1))
+  )
+    (asserts! (is-eq tx-sender (get author paper-info)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status paper-info) "open") ERR_UNAUTHORIZED)
+    
+    (map-set paper-versions
+      { paper-id: paper-id, version: next-version }
+      {
+        title: new-title,
+        abstract: new-abstract,
+        timestamp: stacks-block-height
+      }
+    )
+    
+    (map-set papers
+      { paper-id: paper-id }
+      (merge paper-info { 
+        title: new-title,
+        abstract: new-abstract,
+        current-version: next-version
+      })
+    )
+    
+    (ok next-version)
+  )
+)
+
+(define-read-only (get-paper-version (paper-id uint) (version uint))
+  (map-get? paper-versions { paper-id: paper-id, version: version })
+)
+
+
+(define-constant REVIEW_STAKE_AMOUNT u100)
+(define-constant MIN_ACCEPTABLE_RATING u3)
+(define-constant ERR_REVIEW_ALREADY_RATED (err u111))
+
+(define-map review
+  { paper-id: uint, reviewer: principal }
+  {
+    rating: uint,
+    comment: (string-utf8 500),
+    timestamp: uint,
+    rewarded: bool,
+    author-rating: (optional uint),
+    staked: uint
+  }
+)
+
+(define-public (submit-review-with-stake (paper-id uint) (rating uint) (comment (string-utf8 500)))
+  (let (
+    (user-info (get-user-info tx-sender))
+    (paper-info (unwrap! (get-paper paper-id) ERR_PAPER_NOT_FOUND))
+  )
+    (asserts! (get registered user-info) ERR_NOT_REGISTERED)
+    (asserts! (not (is-eq tx-sender (get author paper-info))) ERR_SELF_REVIEW)
+    (asserts! (is-none (get-review paper-id tx-sender)) ERR_ALREADY_REVIEWED)
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_AMOUNT)
+    (asserts! (>= (ft-get-balance review-token tx-sender) REVIEW_STAKE_AMOUNT) ERR_INSUFFICIENT_BALANCE)
+    
+    (try! (ft-burn? review-token REVIEW_STAKE_AMOUNT tx-sender))
+    
+    (map-set review
+      { paper-id: paper-id, reviewer: tx-sender }
+      {
+        rating: rating,
+        comment: comment,
+        timestamp: stacks-block-height,
+        rewarded: false,
+        author-rating: none,
+        staked: REVIEW_STAKE_AMOUNT
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (rate-review (paper-id uint) (reviewer principal) (author-rating uint))
+  (let (
+    (paper-info (unwrap! (get-paper paper-id) ERR_PAPER_NOT_FOUND))
+    (review-info (unwrap! (get-review paper-id reviewer) ERR_REVIEW_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get author paper-info)) ERR_UNAUTHORIZED)
+    (asserts! (is-none (get author-rating review-info)) ERR_REVIEW_ALREADY_RATED)
+    (asserts! (and (>= author-rating u1) (<= author-rating u5)) ERR_INVALID_AMOUNT)
+    
+    (map-set reviews
+      { paper-id: paper-id, reviewer: reviewer }
+      (merge review-info { author-rating: (some author-rating) })
+    )
+    
+    (if (>= author-rating MIN_ACCEPTABLE_RATING)
+      (try! (ft-mint? review-token (get staked review-info) reviewer))
+      true
+    )
+    
+    (ok author-rating)
   )
 )

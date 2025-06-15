@@ -13,6 +13,47 @@
 (define-constant RESEARCHER_ROLE u2)
 (define-constant REVIEWER_ROLE u3)
 
+
+
+
+(define-constant ERR_DISPUTE_EXISTS (err u200))
+(define-constant ERR_DISPUTE_NOT_FOUND (err u201))
+(define-constant ERR_ALREADY_VOTED (err u202))
+(define-constant ERR_DISPUTE_CLOSED (err u203))
+(define-constant ERR_NOT_ARBITRATOR (err u204))
+(define-constant ERR_INSUFFICIENT_STAKE (err u205))
+
+(define-constant DISPUTE_STAKE_AMOUNT u50)
+(define-constant ARBITRATOR_ROLE u4)
+(define-constant MIN_ARBITRATORS u3)
+
+(define-map disputes
+  { dispute-id: uint }
+  {
+    paper-id: uint,
+    reviewer: principal,
+    author: principal,
+    reason: (string-utf8 200),
+    status: (string-ascii 10),
+    votes-for: uint,
+    votes-against: uint,
+    total-votes: uint,
+    stake-amount: uint,
+    created-at: uint
+  }
+)
+
+(define-map arbitrator-votes
+  { dispute-id: uint, arbitrator: principal }
+  { vote: bool, timestamp: uint }
+)
+
+(define-map arbitrators
+  { arbitrator: principal }
+  { active: bool, cases-resolved: uint }
+)
+
+(define-data-var dispute-id-nonce uint u0)
 (define-fungible-token review-token)
 
 (define-data-var token-uri (string-utf8 256) u"https://review-incentive.org/token-metadata")
@@ -350,4 +391,93 @@
     
     (ok author-rating)
   )
+)
+
+
+(define-public (get-review-stake (paper-id uint) (reviewer principal))
+  (let ((review-info (unwrap! (get-review paper-id reviewer) ERR_REVIEW_NOT_FOUND)))
+    (ok (get staked review-info))
+  )
+)
+(define-public (withdraw-review-stake (paper-id uint) (reviewer principal))
+  (let (
+    (review-info (unwrap! (get-review paper-id reviewer) ERR_REVIEW_NOT_FOUND))
+    (stake-amount (get staked review-info))
+  )
+    (asserts! (is-eq tx-sender reviewer) ERR_UNAUTHORIZED)
+    (asserts! (> stake-amount u0) ERR_INVALID_AMOUNT)
+    
+    (map-set reviews
+      { paper-id: paper-id, reviewer: reviewer }
+      (merge review-info { staked: u0 })
+    )
+    
+    (try! (ft-mint? review-token stake-amount reviewer))
+    
+    (ok true)
+  )
+)
+(define-public (get-reviewer-reputation (reviewer principal))
+  (let ((user-info (get-user-info reviewer)))
+    (ok (get reputation user-info))
+  )
+)
+
+
+
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? disputes { dispute-id: dispute-id })
+)
+
+(define-read-only (is-arbitrator (user principal))
+  (default-to false (get active (map-get? arbitrators { arbitrator: user })))
+)
+
+
+
+(define-public (create-dispute (paper-id uint) (reviewer principal) (reason (string-utf8 200)))
+  (let (
+    (paper-info (unwrap! (get-paper paper-id) ERR_PAPER_NOT_FOUND))
+    (new-dispute-id (+ (var-get dispute-id-nonce) u1))
+  )
+    (asserts! (is-eq tx-sender reviewer) ERR_UNAUTHORIZED)
+    (asserts! (is-none (map-get? disputes { dispute-id: new-dispute-id })) ERR_DISPUTE_EXISTS)
+    
+    (var-set dispute-id-nonce new-dispute-id)
+    (map-set disputes
+      { dispute-id: new-dispute-id }
+      {
+        paper-id: paper-id,
+        reviewer: reviewer,
+        author: (get author paper-info),
+        reason: reason,
+        status: "open",
+        votes-for: u0,
+        votes-against: u0,
+        total-votes: u0,
+        stake-amount: DISPUTE_STAKE_AMOUNT,
+        created-at: stacks-block-height
+      }
+    )
+    (ok new-dispute-id)
+  )
+)
+
+
+(define-read-only (get-dispute-status (dispute-id uint))
+  (let ((dispute-info (get-dispute dispute-id)))
+    (match dispute-info
+      dispute (ok {
+        status: (get status dispute),
+        votes-for: (get votes-for dispute),
+        votes-against: (get votes-against dispute),
+        total-votes: (get total-votes dispute)
+      })
+      ERR_DISPUTE_NOT_FOUND
+    )
+  )
+)
+
+(define-read-only (get-arbitrator-vote (dispute-id uint) (arbitrator principal))
+  (map-get? arbitrator-votes { dispute-id: dispute-id, arbitrator: arbitrator })
 )

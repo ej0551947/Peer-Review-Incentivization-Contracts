@@ -481,3 +481,182 @@
 (define-read-only (get-arbitrator-vote (dispute-id uint) (arbitrator principal))
   (map-get? arbitrator-votes { dispute-id: dispute-id, arbitrator: arbitrator })
 )
+
+
+
+;; (define-constant ERR_UNAUTHORIZED (err u100))
+;; (define-constant ERR_REVIEW_NOT_FOUND (err u109))
+;; (define-constant ERR_INVALID_AMOUNT (err u108))
+(define-constant ERR_INSUFFICIENT_DATA (err u300))
+
+(define-constant QUALITY_WEIGHT_DEPTH u30)
+(define-constant QUALITY_WEIGHT_CONSISTENCY u25)
+(define-constant QUALITY_WEIGHT_AUTHOR_RATING u25)
+(define-constant QUALITY_WEIGHT_TIMELINESS u20)
+(define-constant MAX_QUALITY_SCORE u100)
+(define-constant MIN_REVIEWS_FOR_RANKING u5)
+
+(define-map reviewer-quality-scores
+  { reviewer: principal }
+  {
+    total-score: uint,
+    review-count: uint,
+    average-score: uint,
+    depth-score: uint,
+    consistency-score: uint,
+    author-rating-score: uint,
+    timeliness-score: uint,
+    last-updated: uint
+  }
+)
+
+(define-map review-quality-metrics
+  { paper-id: uint, reviewer: principal }
+  {
+    depth-score: uint,
+    word-count: uint,
+    consistency-score: uint,
+    timeliness-score: uint,
+    quality-score: uint,
+    calculated: bool
+  }
+)
+
+(define-map reviewer-rankings
+  { rank: uint }
+  { reviewer: principal, score: uint }
+)
+
+(define-data-var total-ranked-reviewers uint u0)
+
+(define-read-only (get-reviewer-quality-score (reviewer principal))
+  (default-to
+    {
+      total-score: u0,
+      review-count: u0,
+      average-score: u0,
+      depth-score: u0,
+      consistency-score: u0,
+      author-rating-score: u0,
+      timeliness-score: u0,
+      last-updated: u0
+    }
+    (map-get? reviewer-quality-scores { reviewer: reviewer })
+  )
+)
+
+(define-read-only (get-review-quality-metrics (paper-id uint) (reviewer principal))
+  (map-get? review-quality-metrics { paper-id: paper-id, reviewer: reviewer })
+)
+
+(define-read-only (get-reviewer-ranking (rank uint))
+  (map-get? reviewer-rankings { rank: rank })
+)
+
+
+
+(define-private (calculate-depth-score (comment (string-utf8 500)))
+  (let ((word-count (len comment)))
+    (if (>= word-count u200)
+      u100
+      (if (>= word-count u100)
+        u75
+        (if (>= word-count u50)
+          u50
+          u25
+        )
+      )
+    )
+  )
+)
+
+(define-private (calculate-timeliness-score (review-timestamp uint) (paper-timestamp uint))
+  (let ((time-diff (- review-timestamp paper-timestamp)))
+    (if (<= time-diff u144)
+      u100
+      (if (<= time-diff u288)
+        u75
+        (if (<= time-diff u576)
+          u50
+          u25
+        )
+      )
+    )
+  )
+)
+
+(define-private (calculate-consistency-score (reviewer principal) (current-rating uint))
+  (let (
+    (quality-data (get-reviewer-quality-score reviewer))
+    (review-count (get review-count quality-data))
+  )
+    (if (< review-count u3)
+      u50
+      (let ((avg-rating (/ (get total-score quality-data) review-count)))
+        (if (<= (if (> current-rating avg-rating) (- current-rating avg-rating) (- avg-rating current-rating)) u1)
+          u100
+          (if (<= (if (> current-rating avg-rating) (- current-rating avg-rating) (- avg-rating current-rating)) u2)
+            u75
+            u50
+          )
+        )
+      )
+    )
+  )
+)
+
+
+(define-public (update-reviewer-ranking (reviewer principal) (score uint))
+  (let ((current-total (var-get total-ranked-reviewers)))
+    (map-set reviewer-rankings
+      { rank: (+ current-total u1) }
+      { reviewer: reviewer, score: score }
+    )
+    (var-set total-ranked-reviewers (+ current-total u1))
+    (ok true)
+  )
+)
+
+(define-public (get-quality-bonus (reviewer principal))
+  (let (
+    (quality-data (get-reviewer-quality-score reviewer))
+    (average-score (get average-score quality-data))
+  )
+    (if (>= average-score u90)
+      (ok u150)
+      (if (>= average-score u80)
+        (ok u125)
+        (if (>= average-score u70)
+          (ok u110)
+          (ok u100)
+        )
+      )
+    )
+  )
+)
+
+(define-public (distribute-quality-rewards (paper-id uint) (reviewer principal))
+  (let (
+    (quality-metrics (unwrap! (get-review-quality-metrics paper-id reviewer) ERR_REVIEW_NOT_FOUND))
+    (quality-score (get quality-score quality-metrics))
+    (base-reward u100)
+    (bonus-multiplier (if (>= quality-score u90) u150
+                      (if (>= quality-score u80) u125
+                      (if (>= quality-score u70) u110 u100))))
+    (final-reward (/ (* base-reward bonus-multiplier) u100))
+  )
+    (asserts! (get calculated quality-metrics) ERR_INSUFFICIENT_DATA)
+    ;; (try! (contract-call? .review-incentive mint-tokens final-reward reviewer))
+    (ok final-reward)
+  )
+)
+
+(define-read-only (get-reviewer-stats (reviewer principal))
+  (let ((quality-data (get-reviewer-quality-score reviewer)))
+    (ok {
+      average-quality: (get average-score quality-data),
+      total-reviews: (get review-count quality-data),
+      ranking-eligible: (>= (get review-count quality-data) MIN_REVIEWS_FOR_RANKING)
+    })
+  )
+)

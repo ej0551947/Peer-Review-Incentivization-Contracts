@@ -89,6 +89,68 @@
   }
 )
 
+
+(define-constant ERR_BID_NOT_FOUND (err u400))
+(define-constant ERR_BID_EXISTS (err u401))
+(define-constant ERR_MARKETPLACE_CLOSED (err u402))
+(define-constant ERR_INVALID_TIMELINE (err u403))
+(define-constant ERR_BID_EXPIRED (err u404))
+(define-constant ERR_INSUFFICIENT_BID (err u405))
+(define-constant ERR_MARKETPLACE_NOT_FOUND (err u406))
+(define-constant ERR_REVIEW_SLOT_TAKEN (err u407))
+(define-constant ERR_INVALID_SELECTION (err u408))
+(define-constant ERR_COMPLETION_OVERDUE (err u409))
+
+(define-constant MARKETPLACE_DURATION u1000)
+(define-constant MIN_BID_AMOUNT u10)
+(define-constant MAX_REVIEW_SLOTS u5)
+(define-constant COMPLETION_BUFFER u144)
+(define-constant MARKETPLACE_FEE_PERCENT u5)
+
+(define-map paper-marketplace
+  { paper-id: uint }
+  {
+    author: principal,
+    min-bid: uint,
+    max-slots: uint,
+    filled-slots: uint,
+    deadline: uint,
+    status: (string-ascii 20),
+    total-bids: uint,
+    created-at: uint
+  }
+)
+
+(define-map reviewer-bids
+  { paper-id: uint, reviewer: principal }
+  {
+    bid-amount: uint,
+    proposed-timeline: uint,
+    reviewer-message: (string-utf8 300),
+    reviewer-reputation: uint,
+    bid-timestamp: uint,
+    status: (string-ascii 15),
+    completion-deadline: uint
+  }
+)
+
+(define-map marketplace-selections
+  { paper-id: uint, slot: uint }
+  {
+    reviewer: principal,
+    agreed-amount: uint,
+    selection-timestamp: uint,
+    completion-deadline: uint,
+    completed: bool,
+    payment-released: bool
+  }
+)
+
+(define-map marketplace-escrow
+  { paper-id: uint, reviewer: principal }
+  { amount: uint, locked: bool }
+)
+
 (define-data-var paper-id-nonce uint u0)
 
 (define-read-only (get-token-uri)
@@ -658,5 +720,311 @@
       total-reviews: (get review-count quality-data),
       ranking-eligible: (>= (get review-count quality-data) MIN_REVIEWS_FOR_RANKING)
     })
+  )
+)
+
+
+(define-data-var marketplace-fee-collector principal tx-sender)
+
+(define-read-only (get-marketplace-info (paper-id uint))
+  (map-get? paper-marketplace { paper-id: paper-id })
+)
+
+(define-read-only (get-reviewer-bid (paper-id uint) (reviewer principal))
+  (map-get? reviewer-bids { paper-id: paper-id, reviewer: reviewer })
+)
+
+(define-read-only (get-marketplace-selection (paper-id uint) (slot uint))
+  (map-get? marketplace-selections { paper-id: paper-id, slot: slot })
+)
+
+(define-read-only (get-escrow-amount (paper-id uint) (reviewer principal))
+  (default-to { amount: u0, locked: false }
+    (map-get? marketplace-escrow { paper-id: paper-id, reviewer: reviewer })
+  )
+)
+
+(define-public (create-review-marketplace (paper-id uint) (min-bid uint) (max-slots uint) (duration uint))
+  (let (
+    (paper-info (unwrap! (get-paper paper-id) ERR_PAPER_NOT_FOUND))
+    (marketplace-deadline (+ stacks-block-height duration))
+  )
+    (asserts! (is-eq tx-sender (get author paper-info)) ERR_UNAUTHORIZED)
+    (asserts! (is-none (get-marketplace-info paper-id)) ERR_MARKETPLACE_CLOSED)
+    (asserts! (>= min-bid MIN_BID_AMOUNT) ERR_INSUFFICIENT_BID)
+    (asserts! (and (> max-slots u0) (<= max-slots MAX_REVIEW_SLOTS)) ERR_INVALID_AMOUNT)
+    (asserts! (and (> duration u0) (<= duration MARKETPLACE_DURATION)) ERR_INVALID_TIMELINE)
+    
+    (map-set paper-marketplace
+      { paper-id: paper-id }
+      {
+        author: tx-sender,
+        min-bid: min-bid,
+        max-slots: max-slots,
+        filled-slots: u0,
+        deadline: marketplace-deadline,
+        status: "open",
+        total-bids: u0,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (place-review-bid (paper-id uint) (bid-amount uint) (proposed-timeline uint) (reviewer-message (string-utf8 300)))
+  (let (
+    (marketplace-info (unwrap! (get-marketplace-info paper-id) ERR_MARKETPLACE_NOT_FOUND))
+    (paper-info (unwrap! (get-paper paper-id) ERR_PAPER_NOT_FOUND))
+    (user-info (get-user-info tx-sender))
+    (completion-deadline (+ stacks-block-height proposed-timeline))
+  )
+    (asserts! (get registered user-info) ERR_NOT_REGISTERED)
+    (asserts! (not (is-eq tx-sender (get author paper-info))) ERR_SELF_REVIEW)
+    (asserts! (is-none (get-reviewer-bid paper-id tx-sender)) ERR_BID_EXISTS)
+    (asserts! (is-eq (get status marketplace-info) "open") ERR_MARKETPLACE_CLOSED)
+    (asserts! (< stacks-block-height (get deadline marketplace-info)) ERR_BID_EXPIRED)
+    (asserts! (>= bid-amount (get min-bid marketplace-info)) ERR_INSUFFICIENT_BID)
+    (asserts! (and (> proposed-timeline u0) (<= proposed-timeline u1000)) ERR_INVALID_TIMELINE)
+    (asserts! (>= (ft-get-balance review-token tx-sender) bid-amount) ERR_INSUFFICIENT_BALANCE)
+    
+    (try! (ft-burn? review-token bid-amount tx-sender))
+    
+    (map-set reviewer-bids
+      { paper-id: paper-id, reviewer: tx-sender }
+      {
+        bid-amount: bid-amount,
+        proposed-timeline: proposed-timeline,
+        reviewer-message: reviewer-message,
+        reviewer-reputation: (get reputation user-info),
+        bid-timestamp: stacks-block-height,
+        status: "pending",
+        completion-deadline: completion-deadline
+      }
+    )
+    
+    (map-set marketplace-escrow
+      { paper-id: paper-id, reviewer: tx-sender }
+      { amount: bid-amount, locked: true }
+    )
+    
+    (map-set paper-marketplace
+      { paper-id: paper-id }
+      (merge marketplace-info { total-bids: (+ (get total-bids marketplace-info) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (select-reviewer (paper-id uint) (reviewer principal) (slot uint))
+  (let (
+    (marketplace-info (unwrap! (get-marketplace-info paper-id) ERR_MARKETPLACE_NOT_FOUND))
+    (bid-info (unwrap! (get-reviewer-bid paper-id reviewer) ERR_BID_NOT_FOUND))
+    (paper-info (unwrap! (get-paper paper-id) ERR_PAPER_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get author paper-info)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status marketplace-info) "open") ERR_MARKETPLACE_CLOSED)
+    (asserts! (is-eq (get status bid-info) "pending") ERR_INVALID_SELECTION)
+    (asserts! (and (> slot u0) (<= slot (get max-slots marketplace-info))) ERR_INVALID_AMOUNT)
+    (asserts! (is-none (get-marketplace-selection paper-id slot)) ERR_REVIEW_SLOT_TAKEN)
+    (asserts! (< (get filled-slots marketplace-info) (get max-slots marketplace-info)) ERR_REVIEW_SLOT_TAKEN)
+    
+    (map-set marketplace-selections
+      { paper-id: paper-id, slot: slot }
+      {
+        reviewer: reviewer,
+        agreed-amount: (get bid-amount bid-info),
+        selection-timestamp: stacks-block-height,
+        completion-deadline: (get completion-deadline bid-info),
+        completed: false,
+        payment-released: false
+      }
+    )
+    
+    (map-set reviewer-bids
+      { paper-id: paper-id, reviewer: reviewer }
+      (merge bid-info { status: "accepted" })
+    )
+    
+    (let ((updated-filled-slots (+ (get filled-slots marketplace-info) u1)))
+      (map-set paper-marketplace
+        { paper-id: paper-id }
+        (merge marketplace-info { 
+          filled-slots: updated-filled-slots,
+          status: (if (>= updated-filled-slots (get max-slots marketplace-info)) "filled" "open")
+        })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (complete-marketplace-review (paper-id uint) (reviewer principal) (rating uint) (comment (string-utf8 500)))
+  (let (
+    (marketplace-info (unwrap! (get-marketplace-info paper-id) ERR_MARKETPLACE_NOT_FOUND))
+    (paper-info (unwrap! (get-paper paper-id) ERR_PAPER_NOT_FOUND))
+    (user-info (get-user-info tx-sender))
+  )
+    (asserts! (get registered user-info) ERR_NOT_REGISTERED)
+    (asserts! (is-eq tx-sender reviewer) ERR_UNAUTHORIZED)
+    (asserts! (not (is-eq tx-sender (get author paper-info))) ERR_SELF_REVIEW)
+    (asserts! (is-none (get-review paper-id tx-sender)) ERR_ALREADY_REVIEWED)
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_AMOUNT)
+    
+    (map-set reviews
+      { paper-id: paper-id, reviewer: tx-sender }
+      {
+        rating: rating,
+        comment: comment,
+        timestamp: stacks-block-height,
+        rewarded: false,
+        author-rating: none,
+        staked: u0
+      }
+    )
+    
+    (let ((current-review-count (get review-count paper-info)))
+      (map-set papers
+        { paper-id: paper-id }
+        (merge paper-info { review-count: (+ current-review-count u1) })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (release-marketplace-payment (paper-id uint) (reviewer principal) (slot uint))
+  (let (
+    (marketplace-info (unwrap! (get-marketplace-info paper-id) ERR_MARKETPLACE_NOT_FOUND))
+    (selection-info (unwrap! (get-marketplace-selection paper-id slot) ERR_INVALID_SELECTION))
+    (paper-info (unwrap! (get-paper paper-id) ERR_PAPER_NOT_FOUND))
+    (escrow-info (get-escrow-amount paper-id reviewer))
+    (review-info (get-review paper-id reviewer))
+  )
+    (asserts! (is-eq tx-sender (get author paper-info)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get reviewer selection-info) reviewer) ERR_INVALID_SELECTION)
+    (asserts! (is-some review-info) ERR_REVIEW_NOT_FOUND)
+    (asserts! (not (get payment-released selection-info)) ERR_ALREADY_REVIEWED)
+    (asserts! (get locked escrow-info) ERR_INVALID_AMOUNT)
+    
+    (let (
+      (payment-amount (get agreed-amount selection-info))
+      (marketplace-fee (/ (* payment-amount MARKETPLACE_FEE_PERCENT) u100))
+      (reviewer-payment (- payment-amount marketplace-fee))
+    )
+      (map-set marketplace-selections
+        { paper-id: paper-id, slot: slot }
+        (merge selection-info { payment-released: true, completed: true })
+      )
+      
+      (map-set marketplace-escrow
+        { paper-id: paper-id, reviewer: reviewer }
+        { amount: u0, locked: false }
+      )
+      
+      (try! (ft-mint? review-token reviewer-payment reviewer))
+      (try! (ft-mint? review-token marketplace-fee (var-get marketplace-fee-collector)))
+      
+      (ok reviewer-payment)
+    )
+  )
+)
+
+(define-public (withdraw-expired-bid (paper-id uint) (reviewer principal))
+  (let (
+    (marketplace-info (unwrap! (get-marketplace-info paper-id) ERR_MARKETPLACE_NOT_FOUND))
+    (bid-info (unwrap! (get-reviewer-bid paper-id reviewer) ERR_BID_NOT_FOUND))
+    (escrow-info (get-escrow-amount paper-id reviewer))
+  )
+    (asserts! (is-eq tx-sender reviewer) ERR_UNAUTHORIZED)
+    (asserts! (>= stacks-block-height (get deadline marketplace-info)) ERR_BID_EXPIRED)
+    (asserts! (is-eq (get status bid-info) "pending") ERR_INVALID_SELECTION)
+    (asserts! (get locked escrow-info) ERR_INVALID_AMOUNT)
+    
+    (map-set reviewer-bids
+      { paper-id: paper-id, reviewer: reviewer }
+      (merge bid-info { status: "withdrawn" })
+    )
+    
+    (map-set marketplace-escrow
+      { paper-id: paper-id, reviewer: reviewer }
+      { amount: u0, locked: false }
+    )
+    
+    (try! (ft-mint? review-token (get amount escrow-info) reviewer))
+    
+    (ok true)
+  )
+)
+
+(define-public (claim-overdue-payment (paper-id uint) (reviewer principal) (slot uint))
+  (let (
+    (selection-info (unwrap! (get-marketplace-selection paper-id slot) ERR_INVALID_SELECTION))
+    (escrow-info (get-escrow-amount paper-id reviewer))
+    (review-info (get-review paper-id reviewer))
+  )
+    (asserts! (is-eq tx-sender reviewer) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get reviewer selection-info) reviewer) ERR_INVALID_SELECTION)
+    (asserts! (is-some review-info) ERR_REVIEW_NOT_FOUND)
+    (asserts! (not (get payment-released selection-info)) ERR_ALREADY_REVIEWED)
+    (asserts! (>= stacks-block-height (+ (get completion-deadline selection-info) COMPLETION_BUFFER)) ERR_COMPLETION_OVERDUE)
+    (asserts! (get locked escrow-info) ERR_INVALID_AMOUNT)
+    
+    (let (
+      (payment-amount (get agreed-amount selection-info))
+      (marketplace-fee (/ (* payment-amount MARKETPLACE_FEE_PERCENT) u100))
+      (reviewer-payment (- payment-amount marketplace-fee))
+    )
+      (map-set marketplace-selections
+        { paper-id: paper-id, slot: slot }
+        (merge selection-info { payment-released: true, completed: true })
+      )
+      
+      (map-set marketplace-escrow
+        { paper-id: paper-id, reviewer: reviewer }
+        { amount: u0, locked: false }
+      )
+      
+      (try! (ft-mint? review-token reviewer-payment reviewer))
+      (try! (ft-mint? review-token marketplace-fee (var-get marketplace-fee-collector)))
+      
+      (ok reviewer-payment)
+    )
+  )
+)
+
+(define-public (get-marketplace-stats (paper-id uint))
+  (let ((marketplace-info (unwrap! (get-marketplace-info paper-id) ERR_MARKETPLACE_NOT_FOUND)))
+    (ok {
+      total-bids: (get total-bids marketplace-info),
+      filled-slots: (get filled-slots marketplace-info),
+      max-slots: (get max-slots marketplace-info),
+      min-bid: (get min-bid marketplace-info),
+      status: (get status marketplace-info),
+      deadline: (get deadline marketplace-info)
+    })
+  )
+)
+
+(define-public (get-active-marketplace-bids (paper-id uint))
+  (let ((marketplace-info (unwrap! (get-marketplace-info paper-id) ERR_MARKETPLACE_NOT_FOUND)))
+    (ok {
+      paper-id: paper-id,
+      total-bids: (get total-bids marketplace-info),
+      available-slots: (- (get max-slots marketplace-info) (get filled-slots marketplace-info)),
+      deadline: (get deadline marketplace-info)
+    })
+  )
+)
+
+(define-public (set-marketplace-fee-collector (new-collector principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_UNAUTHORIZED)
+    (var-set marketplace-fee-collector new-collector)
+    (ok true)
   )
 )

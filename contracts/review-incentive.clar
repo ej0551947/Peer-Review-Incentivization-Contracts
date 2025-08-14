@@ -1028,3 +1028,367 @@
     (ok true)
   )
 )
+
+;; Citation Network and Impact Scoring System
+(define-constant ERR_CITATION_EXISTS (err u500))
+(define-constant ERR_CITATION_NOT_FOUND (err u501))
+(define-constant ERR_INVALID_CITATION (err u502))
+(define-constant ERR_SELF_CITATION (err u503))
+(define-constant ERR_CITATION_LIMIT_EXCEEDED (err u504))
+(define-constant ERR_IMPACT_NOT_CALCULATED (err u505))
+
+;; Constants for citation system
+(define-constant MAX_CITATIONS_PER_PAPER u20)
+(define-constant CITATION_REWARD_BASE u25)
+(define-constant IMPACT_CALCULATION_THRESHOLD u3)
+(define-constant CITATION_VERIFICATION_PERIOD u100)
+(define-constant NETWORK_EFFECT_MULTIPLIER u150)
+
+;; Track citations between papers
+(define-map paper-citations
+  { citing-paper: uint, cited-paper: uint }
+  {
+    citation-context: (string-utf8 200),
+    verified: bool,
+    timestamp: uint,
+    citation-type: (string-ascii 15),
+    relevance-score: uint
+  }
+)
+
+;; Track total citations for each paper
+(define-map paper-citation-counts
+  { paper-id: uint }
+  {
+    total-citations: uint,
+    verified-citations: uint,
+    h-index: uint,
+    impact-score: uint,
+    last-calculated: uint,
+    citation-reward-pool: uint
+  }
+)
+
+;; Track author citation networks
+(define-map author-citation-metrics
+  { author: principal }
+  {
+    total-citations-received: uint,
+    total-citations-made: uint,
+    network-reputation: uint,
+    avg-impact-score: uint,
+    active-papers: uint,
+    last-updated: uint
+  }
+)
+
+;; Track citation verification by reviewers
+(define-map citation-verifications
+  { citing-paper: uint, cited-paper: uint, verifier: principal }
+  {
+    verified: bool,
+    verification-timestamp: uint,
+    verifier-reputation: uint
+  }
+)
+
+;; Store citation reward distributions
+(define-map citation-rewards
+  { paper-id: uint, reward-period: uint }
+  {
+    total-rewards: uint,
+    distributed: bool,
+    beneficiaries: uint,
+    reward-per-citation: uint
+  }
+)
+
+(define-data-var citation-reward-pool uint u0)
+(define-data-var total-network-citations uint u0)
+
+;; Read-only functions for citation data
+(define-read-only (get-citation-info (citing-paper uint) (cited-paper uint))
+  (map-get? paper-citations { citing-paper: citing-paper, cited-paper: cited-paper })
+)
+
+(define-read-only (get-paper-citation-stats (paper-id uint))
+  (default-to
+    {
+      total-citations: u0,
+      verified-citations: u0,
+      h-index: u0,
+      impact-score: u0,
+      last-calculated: u0,
+      citation-reward-pool: u0
+    }
+    (map-get? paper-citation-counts { paper-id: paper-id })
+  )
+)
+
+(define-read-only (get-author-citation-metrics (author principal))
+  (default-to
+    {
+      total-citations-received: u0,
+      total-citations-made: u0,
+      network-reputation: u0,
+      avg-impact-score: u0,
+      active-papers: u0,
+      last-updated: u0
+    }
+    (map-get? author-citation-metrics { author: author })
+  )
+)
+
+;; Submit a citation when publishing a new paper
+(define-public (add-paper-citation (citing-paper uint) (cited-paper uint) (citation-context (string-utf8 200)) (citation-type (string-ascii 15)))
+  (let (
+    (citing-paper-info (unwrap! (get-paper citing-paper) ERR_PAPER_NOT_FOUND))
+    (cited-paper-info (unwrap! (get-paper cited-paper) ERR_PAPER_NOT_FOUND))
+    (citing-author (get author citing-paper-info))
+    (cited-author (get author cited-paper-info))
+    (existing-citation (get-citation-info citing-paper cited-paper))
+  )
+    ;; Verify citation is valid
+    (asserts! (is-eq tx-sender citing-author) ERR_UNAUTHORIZED)
+    (asserts! (not (is-eq citing-paper cited-paper)) ERR_SELF_CITATION)
+    (asserts! (not (is-eq citing-author cited-author)) ERR_SELF_CITATION)
+    (asserts! (is-none existing-citation) ERR_CITATION_EXISTS)
+    
+    ;; Check citation limits
+    (let ((current-citations (count-paper-citations citing-paper)))
+      (asserts! (< current-citations MAX_CITATIONS_PER_PAPER) ERR_CITATION_LIMIT_EXCEEDED)
+    )
+    
+    ;; Record the citation
+    (map-set paper-citations
+      { citing-paper: citing-paper, cited-paper: cited-paper }
+      {
+        citation-context: citation-context,
+        verified: false,
+        timestamp: stacks-block-height,
+        citation-type: citation-type,
+        relevance-score: u0
+      }
+    )
+    
+    ;; Update citation counts
+    (update-citation-counts cited-paper)
+    (update-author-metrics citing-author cited-author)
+    (var-set total-network-citations (+ (var-get total-network-citations) u1))
+    
+    (ok true)
+  )
+)
+
+;; Verify a citation (called by qualified reviewers)
+(define-public (verify-citation (citing-paper uint) (cited-paper uint) (relevance-score uint))
+  (let (
+    (citation-info (unwrap! (get-citation-info citing-paper cited-paper) ERR_CITATION_NOT_FOUND))
+    (verifier-info (get-user-info tx-sender))
+    (existing-verification (map-get? citation-verifications { citing-paper: citing-paper, cited-paper: cited-paper, verifier: tx-sender }))
+  )
+    ;; Check verifier qualifications
+    (asserts! (get registered verifier-info) ERR_NOT_REGISTERED)
+    (asserts! (>= (get reputation verifier-info) u50) ERR_UNAUTHORIZED)
+    (asserts! (is-none existing-verification) ERR_ALREADY_REVIEWED)
+    (asserts! (and (>= relevance-score u1) (<= relevance-score u10)) ERR_INVALID_AMOUNT)
+    
+    ;; Record verification
+    (map-set citation-verifications
+      { citing-paper: citing-paper, cited-paper: cited-paper, verifier: tx-sender }
+      {
+        verified: true,
+        verification-timestamp: stacks-block-height,
+        verifier-reputation: (get reputation verifier-info)
+      }
+    )
+    
+    ;; Update citation with verification
+    (map-set paper-citations
+      { citing-paper: citing-paper, cited-paper: cited-paper }
+      (merge citation-info { 
+        verified: true,
+        relevance-score: relevance-score
+      })
+    )
+    
+    ;; Update verified citation count
+    (let ((citation-stats (get-paper-citation-stats cited-paper)))
+      (map-set paper-citation-counts
+        { paper-id: cited-paper }
+        (merge citation-stats { 
+          verified-citations: (+ (get verified-citations citation-stats) u1)
+        })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Calculate impact score for a paper
+(define-public (calculate-impact-score (paper-id uint))
+  (let (
+    (citation-stats (get-paper-citation-stats paper-id))
+    (paper-info (unwrap! (get-paper paper-id) ERR_PAPER_NOT_FOUND))
+    (total-citations (get total-citations citation-stats))
+    (verified-citations (get verified-citations citation-stats))
+  )
+    ;; Require minimum citations for calculation
+    (asserts! (>= total-citations IMPACT_CALCULATION_THRESHOLD) ERR_IMPACT_NOT_CALCULATED)
+    
+    (let (
+      ;; Calculate weighted impact score
+      (base-score (* total-citations u10))
+      (verification-bonus (* verified-citations u15))
+      (network-effect (/ (* total-citations (var-get total-network-citations)) u100))
+      (age-factor (if (> paper-id u50) u80 u100))
+      (final-impact (/ (* (+ base-score verification-bonus network-effect) age-factor) u100))
+    )
+      ;; Update impact score
+      (map-set paper-citation-counts
+        { paper-id: paper-id }
+        (merge citation-stats {
+          impact-score: final-impact,
+          last-calculated: stacks-block-height
+        })
+      )
+      
+      ;; Update author metrics
+      (update-author-impact-metrics (get author paper-info) final-impact)
+      
+      (ok final-impact)
+    )
+  )
+)
+
+;; Distribute citation rewards to highly cited papers
+(define-public (distribute-citation-rewards (paper-id uint))
+  (let (
+    (citation-stats (get-paper-citation-stats paper-id))
+    (paper-info (unwrap! (get-paper paper-id) ERR_PAPER_NOT_FOUND))
+    (impact-score (get impact-score citation-stats))
+    (verified-citations (get verified-citations citation-stats))
+  )
+    ;; Check eligibility for rewards
+    (asserts! (> impact-score u50) ERR_IMPACT_NOT_CALCULATED)
+    (asserts! (>= verified-citations u3) ERR_INSUFFICIENT_DATA)
+    
+    (let (
+      ;; Calculate reward based on impact and citations
+      (base-reward CITATION_REWARD_BASE)
+      (impact-multiplier (/ impact-score u10))
+      (citation-bonus (* verified-citations u5))
+      (total-reward (+ base-reward impact-multiplier citation-bonus))
+    )
+      ;; Distribute rewards to paper author
+      (try! (ft-mint? review-token total-reward (get author paper-info)))
+      
+      ;; Update citation reward pool
+      (map-set paper-citation-counts
+        { paper-id: paper-id }
+        (merge citation-stats {
+          citation-reward-pool: (+ (get citation-reward-pool citation-stats) total-reward)
+        })
+      )
+      
+      (ok total-reward)
+    )
+  )
+)
+
+;; Helper function to count citations for a paper
+(define-private (count-paper-citations (paper-id uint))
+  (get total-citations (get-paper-citation-stats paper-id))
+)
+
+;; Helper function to update citation counts
+(define-private (update-citation-counts (paper-id uint))
+  (let ((current-stats (get-paper-citation-stats paper-id)))
+    (map-set paper-citation-counts
+      { paper-id: paper-id }
+      (merge current-stats {
+        total-citations: (+ (get total-citations current-stats) u1)
+      })
+    )
+    true
+  )
+)
+
+;; Helper function to update author citation metrics
+(define-private (update-author-metrics (citing-author principal) (cited-author principal))
+  (begin
+    ;; Update citing author stats
+    (let ((citing-metrics (get-author-citation-metrics citing-author)))
+      (map-set author-citation-metrics
+        { author: citing-author }
+        (merge citing-metrics {
+          total-citations-made: (+ (get total-citations-made citing-metrics) u1),
+          last-updated: stacks-block-height
+        })
+      )
+    )
+    
+    ;; Update cited author stats
+    (let ((cited-metrics (get-author-citation-metrics cited-author)))
+      (map-set author-citation-metrics
+        { author: cited-author }
+        (merge cited-metrics {
+          total-citations-received: (+ (get total-citations-received cited-metrics) u1),
+          last-updated: stacks-block-height
+        })
+      )
+    )
+    true
+  )
+)
+
+;; Helper function to update author impact metrics
+(define-private (update-author-impact-metrics (author principal) (new-impact uint))
+  (let ((current-metrics (get-author-citation-metrics author)))
+    (let (
+      (current-papers (get active-papers current-metrics))
+      (current-avg (get avg-impact-score current-metrics))
+      (new-avg (if (> current-papers u0)
+                 (/ (+ (* current-avg current-papers) new-impact) (+ current-papers u1))
+                 new-impact))
+    )
+      (map-set author-citation-metrics
+        { author: author }
+        (merge current-metrics {
+          avg-impact-score: new-avg,
+          active-papers: (+ current-papers u1),
+          last-updated: stacks-block-height
+        })
+      )
+    )
+    true
+  )
+)
+
+;; Get citation network statistics
+(define-read-only (get-network-stats)
+  (ok {
+    total-citations: (var-get total-network-citations),
+    reward-pool: (var-get citation-reward-pool),
+    active-papers: (var-get paper-id-nonce)
+  })
+)
+
+;; Check if author qualifies for citation bonus
+(define-public (get-citation-reputation-bonus (author principal))
+  (let ((metrics (get-author-citation-metrics author)))
+    (let (
+      (citations-received (get total-citations-received metrics))
+      (avg-impact (get avg-impact-score metrics))
+    )
+      (if (and (>= citations-received u10) (>= avg-impact u75))
+        (ok u200)  ;; 200% reputation multiplier for highly cited authors
+        (if (and (>= citations-received u5) (>= avg-impact u50))
+          (ok u150)  ;; 150% multiplier for moderately cited authors
+          (ok u100)  ;; Standard multiplier
+        )
+      )
+    )
+  )
+)
